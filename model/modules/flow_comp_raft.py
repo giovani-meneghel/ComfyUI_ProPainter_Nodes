@@ -9,15 +9,23 @@ from .flow_loss_utils import flow_warp, ternary_loss2
 
 def initialize_RAFT(model_path="weights/raft-things.pth", device="cuda"):
     """Initializes the RAFT model."""
-    args = argparse.ArgumentParser()
-    args.raft_model = model_path
+    print(f"[ProPainter] initialize_RAFT starting with path: {model_path}")
+    import os
+    if not os.path.exists(model_path):
+        print(f"[ProPainter] RAFT model path does NOT exist: {model_path}")
+    
+    args = argparse.Namespace()
+    args.raft_model = str(model_path)
     args.small = False
     args.mixed_precision = False
     args.alternate_corr = False
     model = torch.nn.DataParallel(RAFT(args))
+    
+    print(f"[ProPainter] Loading RAFT state dict...")
     model.load_state_dict(torch.load(args.raft_model, map_location="cpu"))
     model = model.module
 
+    print(f"[ProPainter] Moving RAFT to device: {device}")
     model.to(device)
 
     return model

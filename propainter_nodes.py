@@ -1,5 +1,11 @@
 import torch
+import os
+import sys
+import traceback
+from pathlib import Path
+
 from comfy import model_management
+from comfy.utils import ProgressBar
 
 from .propainter_inference import (
     ProPainterConfig,
@@ -14,8 +20,10 @@ from .utils.image_utils import (
     prepare_frames_and_masks,
     extrapolation,
     prepare_frames_and_masks_for_outpaint,
+    resize_tensor,
 )
 from .utils.model_utils import initialize_models
+
 
 
 def check_inputs(frames: torch.Tensor, masks: torch.Tensor) -> Exception | None:
@@ -47,8 +55,8 @@ class ProPainterInpaint:
             "required": {
                 "image": ("IMAGE",),  # --video
                 "mask": ("MASK",),  # --mask
-                "width": ("INT", {"default": 640, "min": 0, "max": 2560}),  # --width
-                "height": ("INT", {"default": 360, "min": 0, "max": 2560}),  # --height
+                "width": ("INT", {"default": 0, "min": 0, "max": 2560}),  # --width
+                "height": ("INT", {"default": 0, "min": 0, "max": 2560}),  # --height
                 "mask_dilates": (
                     "INT",
                     {"default": 5, "min": 0, "max": 100},
@@ -105,53 +113,84 @@ class ProPainterInpaint:
         fp16: str,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Perform inpainting on images input using the ProPainter model inference."""
-        check_inputs(image, mask)
-        device = model_management.get_torch_device()
-        # TODO: Check if this convertion from Torch to PIL is really necessary.
-        frames = convert_image_to_frames(image)
-        video_length = image.size(dim=0)
-        input_size = frames[0].size
+        try:
+            print("[ProPainter] Starting Inpaint Node execution...", file=sys.stderr, flush=True)
+            
+            
+            # Initialize progress bar (100 steps, weighted across phases)
+            pbar = ProgressBar(100)
+            
+            device = model_management.get_torch_device()
+            
 
-        image_config = ImageConfig(
-            width, height, mask_dilates, flow_mask_dilates, input_size, video_length
-        )
-        inpaint_config = ProPainterConfig(
-            ref_stride,
-            neighbor_length,
-            subvideo_length,
-            raft_iter,
-            fp16,
-            video_length,
-            device,
-            image_config.process_size,
-        )
+            
+            video_length = image.size(dim=0)
+            input_size = (image.shape[2], image.shape[1]) # (W, H)
+            
+            # Auto-detect resolution and align to 8 (required by ProPainter)
+            process_width = width if width > 0 else input_size[0]
+            process_height = height if height > 0 else input_size[1]
+            process_width = process_width - process_width % 8
+            process_height = process_height - process_height % 8
+            
+            if process_width != input_size[0] or process_height != input_size[1]:
+                image = resize_tensor(image, process_width, process_height, mode="area")
+                mask = resize_tensor(mask, process_width, process_height, mode="area")
+                input_size = (process_width, process_height)
 
-        frames_tensor, flow_masks_tensor, masks_dilated_tensor, original_frames = (
-            prepare_frames_and_masks(frames, mask, image_config, device)
-        )
+            check_inputs(image, mask)
 
-        models = initialize_models(device, inpaint_config.fp16)
-        print(f"\nProcessing  {inpaint_config.video_length} frames...")
+            frames = convert_image_to_frames(image)
 
-        updated_frames, updated_masks, pred_flows_bi = process_inpainting(
-            models,
-            frames_tensor,
-            flow_masks_tensor,
-            masks_dilated_tensor,
-            inpaint_config,
-        )
+            image_config = ImageConfig(
+                process_width, process_height, mask_dilates, flow_mask_dilates, input_size, video_length
+            )
+            
+            inpaint_config = ProPainterConfig(
+                ref_stride,
+                neighbor_length,
+                subvideo_length,
+                raft_iter,
+                fp16,
+                video_length,
+                device,
+                image_config.process_size,
+            )
 
-        composed_frames = feature_propagation(
-            models.inpaint_model,
-            updated_frames,
-            updated_masks,
-            masks_dilated_tensor,
-            pred_flows_bi,
-            original_frames,
-            inpaint_config,
-        )
+            frames_tensor, flow_masks_tensor, masks_dilated_tensor, original_frames = (
+                prepare_frames_and_masks(frames, mask, image_config, device)
+            )
 
-        return handle_output(composed_frames, flow_masks_tensor, masks_dilated_tensor)
+            models = initialize_models(device, inpaint_config.fp16)
+            
+            updated_frames, updated_masks, pred_flows_bi = process_inpainting(
+                models,
+                frames_tensor,
+                flow_masks_tensor,
+                masks_dilated_tensor,
+                inpaint_config,
+                pbar=pbar,
+            )
+
+            composed_frames = feature_propagation(
+                models.inpaint_model,
+                updated_frames,
+                updated_masks,
+                masks_dilated_tensor,
+                pred_flows_bi,
+                image, # Pass original float32 tensor
+                inpaint_config,
+                pbar=pbar,
+            )
+
+            # Clean up GPU tensors before building output
+            del updated_frames, updated_masks, pred_flows_bi
+            model_management.soft_empty_cache()
+
+            return handle_output(composed_frames, flow_masks_tensor, masks_dilated_tensor)
+        except Exception as e:
+            # traceback.print_exc()
+            raise e
 
 
 class ProPainterOutpaint:
@@ -165,8 +204,8 @@ class ProPainterOutpaint:
         return {
             "required": {
                 "image": ("IMAGE",),  # --video
-                "width": ("INT", {"default": 640, "min": 0, "max": 2560}),  # --width
-                "height": ("INT", {"default": 360, "min": 0, "max": 2560}),  # --height
+                "width": ("INT", {"default": 0, "min": 0, "max": 2560}),  # --width
+                "height": ("INT", {"default": 0, "min": 0, "max": 2560}),  # --height
                 "width_scale": (
                     "FLOAT",
                     {
@@ -244,70 +283,96 @@ class ProPainterOutpaint:
         fp16: str,
     ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
         """Perform inpainting on images input using the ProPainter model inference."""
-        device = model_management.get_torch_device()
-        # TODO: Check if this convertion from Torch to PIL is really necessary.
-        frames = convert_image_to_frames(image)
-        video_length = image.size(dim=0)
-        input_size = frames[0].size
+        try:
+            print("[ProPainter] Starting Outpaint Node execution...", file=sys.stderr, flush=True)
+            # Initialize progress bar (100 steps, weighted across phases)
+            pbar = ProgressBar(100)
 
-        image_config = ImageOutpaintConfig(
-            width,
-            height,
-            mask_dilates,
-            flow_mask_dilates,
-            input_size,
-            video_length,
-            width_scale,
-            height_scale,
-        )
+            device = model_management.get_torch_device()
+            
 
-        outpaint_config = ProPainterConfig(
-            ref_stride,
-            neighbor_length,
-            subvideo_length,
-            raft_iter,
-            fp16,
-            video_length,
-            device,
-            image_config.outpaint_size,
-        )
+            
+            video_length = image.size(dim=0)
+            input_size = (image.shape[2], image.shape[1]) # (W, H)
+            
+            # Auto-detect resolution and align to 8 (required by ProPainter)
+            process_width = width if width > 0 else input_size[0]
+            process_height = height if height > 0 else input_size[1]
+            process_width = process_width - process_width % 8
+            process_height = process_height - process_height % 8
 
-        paded_frames, paded_flow_masks, paded_masks_dilated = extrapolation(
-            frames, image_config
-        )
+            if process_width != input_size[0] or process_height != input_size[1]:
+                image = resize_tensor(image, process_width, process_height, mode="area")
+                input_size = (process_width, process_height)
 
-        frames_tensor, flow_masks_tensor, masks_dilated_tensor, original_frames = (
-            prepare_frames_and_masks_for_outpaint(
-                paded_frames, paded_flow_masks, paded_masks_dilated, device
+            frames = convert_image_to_frames(image)
+
+            image_config = ImageOutpaintConfig(
+                process_width,
+                process_height,
+                mask_dilates,
+                flow_mask_dilates,
+                input_size,
+                video_length,
+                width_scale,
+                height_scale,
             )
-        )
 
-        models = initialize_models(device, outpaint_config.fp16)
-        print(f"\nProcessing  {outpaint_config.video_length} frames...")
+            outpaint_config = ProPainterConfig(
+                ref_stride,
+                neighbor_length,
+                subvideo_length,
+                raft_iter,
+                fp16,
+                video_length,
+                device,
+                image_config.outpaint_size,
+            )
 
-        updated_frames, updated_masks, pred_flows_bi = process_inpainting(
-            models,
-            frames_tensor,
-            flow_masks_tensor,
-            masks_dilated_tensor,
-            outpaint_config,
-        )
+            paded_frames, paded_flow_masks, paded_masks_dilated = extrapolation(
+                frames, image_config
+            )
 
-        composed_frames = feature_propagation(
-            models.inpaint_model,
-            updated_frames,
-            updated_masks,
-            masks_dilated_tensor,
-            pred_flows_bi,
-            original_frames,
-            outpaint_config,
-        )
+            frames_tensor, flow_masks_tensor, masks_dilated_tensor, original_frames = (
+                prepare_frames_and_masks_for_outpaint(
+                    paded_frames, paded_flow_masks, paded_masks_dilated, device
+                )
+            )
 
-        output_frames, output_masks, _ = handle_output(
-            composed_frames, flow_masks_tensor, masks_dilated_tensor
-        )
-        output_width, output_height = outpaint_config.process_size
-        return output_frames, output_masks, output_width, output_height
+            models = initialize_models(device, outpaint_config.fp16)
+            
+            updated_frames, updated_masks, pred_flows_bi = process_inpainting(
+                models,
+                frames_tensor,
+                flow_masks_tensor,
+                masks_dilated_tensor,
+                outpaint_config,
+                pbar=pbar,
+            )
+
+            composed_frames = feature_propagation(
+                models.inpaint_model,
+                updated_frames,
+                updated_masks,
+                masks_dilated_tensor,
+                pred_flows_bi,
+                original_frames, # Keep list of NDArray for outpaint for now
+                outpaint_config,
+                pbar=pbar,
+            )
+
+            # Clean up GPU tensors before building output
+            del updated_frames, updated_masks, pred_flows_bi
+            model_management.soft_empty_cache()
+
+            output_frames, output_masks, _ = handle_output(
+                composed_frames, flow_masks_tensor, masks_dilated_tensor
+            )
+            output_width, output_height = outpaint_config.process_size
+            return output_frames, output_masks, output_width, output_height
+        except Exception as e:
+            traceback.print_exc()
+            raise e
 
 
 NODE_CLASS_MAPPINGS = {

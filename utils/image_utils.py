@@ -5,8 +5,34 @@ import scipy
 import torch
 from numpy.typing import NDArray
 from PIL import Image
+import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.transforms.functional import to_pil_image
+
+
+def resize_tensor(tensor: torch.Tensor, width: int, height: int, mode: str = "area") -> torch.Tensor:
+    """Resize a [B, H, W, C] (IMAGE) or [B, H, W] (MASK) tensor.
+    
+    Using 'area' filter is recommended for downsampling to avoid artifacts.
+    """
+    curr_h, curr_w = tensor.shape[1], tensor.shape[2]
+    if curr_h == height and curr_w == width:
+        return tensor
+
+    # Check if it's an image [B, H, W, C] or mask [B, H, W]
+    if len(tensor.shape) == 4: # IMAGE [B, H, W, C]
+        # Permute to [B, C, H, W] for interpolate
+        t = tensor.permute(0, 3, 1, 2)
+        t = F.interpolate(t, size=(height, width), mode=mode)
+        return t.permute(0, 2, 3, 1)
+    elif len(tensor.shape) == 3: # MASK [B, H, W]
+        # Add channel dim for [B, 1, H, W]
+        t = tensor.unsqueeze(1)
+        t = F.interpolate(t, size=(height, width), mode=mode)
+        return t.squeeze(1)
+    
+    return tensor
+
 
 
 @dataclass
@@ -96,9 +122,14 @@ def to_tensors():
 
 
 def resize_images(images: list[Image.Image], config: ImageConfig) -> list[Image.Image]:
-    """Resizes each image in the list to a new size divisible by 8."""
+    """Resizes each image in the list to a new size divisible by 8 if necessary.
+    
+    Note: If sensors were already resized via resize_tensor, this function will typically be a no-op.
+    """
     if config.process_size != config.input_size:
-        images = [f.resize(config.process_size) for f in images]
+        # Fallback to BICUBIC for PIL images if they still need resizing
+        resampling = getattr(Image, 'Resampling', Image).BICUBIC
+        images = [f.resize(config.process_size, resampling) for f in images]
 
     return images
 
